@@ -3460,6 +3460,21 @@ fn is_hard_precondition_error(error: &AppError) -> bool {
     matches!(error, AppError::InvalidInput(_) | AppError::Conflict(_))
 }
 
+/// Process-wide registry for per-tool analytics.
+///
+/// Set once at server startup by `main` via [`set_tool_stats`]; read by
+/// [`finalize_tool`] on every tool invocation. When unset (e.g. in unit
+/// tests), recording is silently skipped.
+static TOOL_STATS: std::sync::OnceLock<std::sync::Arc<crate::admin::ToolStatsRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Install the global [`ToolStatsRegistry`].
+///
+/// Idempotent: subsequent calls return the originally installed instance.
+pub fn set_tool_stats(stats: std::sync::Arc<crate::admin::ToolStatsRegistry>) {
+    let _ = TOOL_STATS.set(stats);
+}
+
 /// Build a standardized MCP tool response envelope from business logic output
 fn finalize_tool<T>(
     started: Instant,
@@ -3469,11 +3484,17 @@ fn finalize_tool<T>(
 where
     T: schemars::JsonSchema,
 {
+    let elapsed_ms = duration_ms(started);
+    let is_error = result.is_err();
+    if let Some(stats) = TOOL_STATS.get() {
+        stats.record(tool, elapsed_ms, is_error);
+    }
+
     match result {
         Ok((summary, data)) => Ok(Json(ToolEnvelope {
             summary,
             data,
-            meta: Meta::now(duration_ms(started)),
+            meta: Meta::now(elapsed_ms),
         })),
         Err(e) => {
             error!(
@@ -3485,6 +3506,46 @@ where
             Err(e.to_error_data())
         }
     }
+}
+
+/// Static catalog of all MCP tools registered by this server.
+///
+/// Used by the admin UI's `/api/tools` endpoint to render the analytics
+/// page. The list is hand-maintained alongside the `#[tool(...)]`
+/// attributes so the admin UI can show a tool even before its first call.
+pub fn tool_catalog() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("list_all_accounts", "List all configured accounts with their capabilities"),
+        ("imap_list_accounts", "List configured IMAP accounts"),
+        ("imap_verify_account", "Verify IMAP connectivity and capabilities"),
+        ("imap_list_mailboxes", "List mailboxes for an account"),
+        ("imap_search_messages", "Search messages with cursor pagination"),
+        ("imap_get_message", "Get parsed message details"),
+        ("imap_get_message_raw", "Get raw RFC822 message source"),
+        ("imap_update_message_flags", "Add/remove flags on a message"),
+        ("imap_copy_message", "Copy a message to another mailbox"),
+        ("imap_move_message", "Move a message to another mailbox"),
+        ("imap_delete_message", "Permanently delete a message"),
+        ("imap_create_mailbox", "Create a mailbox/folder"),
+        ("imap_delete_mailbox", "Delete a mailbox/folder"),
+        ("imap_rename_mailbox", "Rename a mailbox/folder"),
+        ("imap_mailbox_status", "Get mailbox message counts"),
+        ("imap_bulk_move", "Move up to 500 messages at once"),
+        ("imap_bulk_delete", "Delete up to 500 messages at once"),
+        ("imap_bulk_update_flags", "Update flags on up to 500 messages at once"),
+        ("imap_append_message", "Append a raw RFC822 message to a mailbox"),
+        ("imap_search_and_move", "Search + move matching messages"),
+        ("imap_search_and_delete", "Search + delete matching messages"),
+        ("smtp_send_message", "Send a new email via SMTP"),
+        ("smtp_reply_message", "Reply to an email via SMTP with threading headers"),
+        ("smtp_forward_message", "Forward an email via SMTP"),
+        ("smtp_verify_account", "Verify SMTP connectivity and authentication"),
+        ("graph_send_message", "Send via Microsoft Graph API"),
+        ("ews_search_messages", "Search messages via Exchange Web Services"),
+        ("ews_get_message", "Get a message via Exchange Web Services"),
+        ("ews_send_message", "Send a message via Exchange Web Services"),
+        ("get_setup_guide", "Provider-specific account setup instructions"),
+    ]
 }
 
 /// Parse message_id, validate mailbox, and enforce account_id match.

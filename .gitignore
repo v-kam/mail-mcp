@@ -29,3 +29,11 @@
 
 # Playwright CLI
 .playwright-cli/
+
+.cursor/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep
+frontend/tsconfig.tsbuildinfo

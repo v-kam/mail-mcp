@@ -1,0 +1,55 @@
+name: Admin UI smoke
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-curl:
+    name: docker build + /api/health
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build container
+        run: docker build -t mail-mcp:smoke .
+
+      - name: Run container with admin UI enabled
+        run: |
+          set -euxo pipefail
+          docker run -d --name mail-mcp-smoke \
+            -e MAIL_MCP_ADMIN_PORT=8080 \
+            -e MAIL_MCP_ADMIN_TOKEN=ci-token \
+            -e MAIL_MCP_ADMIN_KEY=ci-key \
+            -e MAIL_MCP_DATA_DIR=/data \
+            -p 8080:8080 \
+            mail-mcp:smoke
+          for i in $(seq 1 30); do
+            if curl -sSf http://127.0.0.1:8080/api/health > /tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          jq -e '.status == "ok"' /tmp/health.json
+          # Authenticated endpoint must reject without a token.
+          status=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/accounts)
+          test "$status" = "401"
+          # And accept with the right token.
+          curl -sSf -H "Authorization: Bearer ci-token" \
+            http://127.0.0.1:8080/api/accounts | jq -e '.accounts | length >= 0'
+
+      - name: Container logs
+        if: always()
+        run: docker logs mail-mcp-smoke || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f mail-mcp-smoke || true

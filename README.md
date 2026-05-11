@@ -15,6 +15,58 @@
 
 Most email MCP servers only do IMAP reads. This one does **everything**: read, search, send, reply, forward, bulk operations, Microsoft Graph API, and Exchange Web Services — with real OAuth2, multi-account, and multi-provider support. Written in Rust for speed and safety.
 
+It speaks MCP over **two transports** in the same binary:
+
+- **stdio** — classic launcher mode for editor-spawned agents.
+- **Streamable HTTP** (MCP 2025-03-26) at `POST /mcp` — connect a
+  long-lived AI client to a daemonised container.
+
+It also ships with a built-in **management UI** (React, embedded into
+the binary) on the same HTTP port so you can add and verify accounts,
+watch per-tool usage analytics, and toggle the write/send gates without
+restarting the container. See the [admin UI guide](docs/admin-ui.md).
+
+## What's New in v0.5.0
+
+- **HTTP MCP transport** — the same admin port now also serves the MCP
+  "Streamable HTTP" transport at `/mcp`. Run the container constantly
+  and connect your AI client over HTTP/SSE instead of spawning the
+  binary over stdio. Cursor and other MCP-aware clients with native
+  HTTP support work directly; Claude Desktop works via `mcp-remote`.
+  Disable with `MAIL_MCP_HTTP_ENABLED=false` if you want only stdio.
+- **Embedded React management UI** — the binary ships with an admin
+  HTTP server (off by default) that lets you add, edit, delete, and
+  verify mail accounts from your browser, watch per-tool MCP usage
+  analytics, and toggle the IMAP write / SMTP send gates. Enable it by
+  setting `MAIL_MCP_ADMIN_TOKEN` + `MAIL_MCP_ADMIN_KEY` and exposing
+  port `8080`. Full guide: [docs/admin-ui.md](docs/admin-ui.md).
+  - **Provider-aware account wizard.** Pick Gmail / Microsoft / iCloud
+    / Yahoo / Fastmail / Zoho / Custom and the UI pre-fills hosts,
+    ports, and auth method for you.
+  - **`/setup` cookbook.** Copyable connection details and direct
+    deep-links to mint the right credential per provider (e.g. Gmail
+    App Passwords at <https://myaccount.google.com/apppasswords>,
+    iCloud app-specific passwords, Microsoft Entra app registrations).
+  - **Tailwind + shadcn/ui** end-to-end — no hand-written CSS.
+- **One bearer token, one boundary.** `MAIL_MCP_ADMIN_TOKEN` gates the
+  admin UI, the REST API, *and* the new `/mcp` HTTP transport with the
+  same constant-time check.
+- **SQLite-backed account store** with **at-rest secret encryption**
+  (ChaCha20-Poly1305 AEAD with Argon2id key derivation from
+  `MAIL_MCP_ADMIN_KEY`). Env-var configuration is still supported and
+  is auto-seeded into the store on first boot.
+- **Tool usage analytics** — every MCP tool invocation increments a
+  per-tool counter (calls, errors, average + max duration, last call
+  time) surfaced at `/api/analytics`.
+- **Dockerfile rewrite** — the previous image referenced a stale binary
+  name (`mail-imap-mcp-rs`). It now correctly copies `mail-mcp`,
+  embeds the UI via a multi-stage Node + Rust build, and declares
+  `/data` as a persistent volume.
+- **Hardenings** — `MAIL_MCP_UPDATE_CHECK=false` opts out of the
+  startup update-check phone-home (and is the default when the admin
+  UI is enabled). New CI workflows: `cargo audit`, `npm audit`, and an
+  admin-UI smoke test.
+
 ## What's New in v0.4.5
 
 - **`serverInfo` ahora reporta `name="mail-mcp"` + `version` del crate** (antes
@@ -204,6 +256,58 @@ Add to your MCP client config (Claude Code, Cursor, etc.):
 ```
 
 That's it. Your AI agent can now read, search, send, reply, and manage emails.
+
+### Prefer HTTP? Run the container as a daemon
+
+If you don't want every AI client launch to spawn a child process,
+run the container constantly and let your AI client connect to it
+over HTTP at `/mcp`. Same binary, same accounts, same encrypted
+SQLite store — different transport.
+
+```bash
+docker run -d --name mail-mcp -p 8080:8080 \
+  -v mail-mcp-data:/data \
+  -e MAIL_MCP_ADMIN_TOKEN="$(openssl rand -hex 32)" \
+  -e MAIL_MCP_ADMIN_KEY="$(openssl rand -hex 32)" \
+  ghcr.io/tecnologicachile/mail-mcp:latest
+```
+
+Then use one of these client configs (the dashboard at
+`http://localhost:8080` shows you the same snippets with the right
+URL and token already filled in):
+
+**Cursor / native HTTP MCP** (`~/.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "mail-mcp": {
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer YOUR_ADMIN_TOKEN" }
+    }
+  }
+}
+```
+
+**Claude Desktop** (uses `mcp-remote` to bridge stdio → HTTP):
+
+```json
+{
+  "mcpServers": {
+    "mail-mcp": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://localhost:8080/mcp",
+        "--header", "Authorization:Bearer YOUR_ADMIN_TOKEN"
+      ]
+    }
+  }
+}
+```
+
+The token gates both the admin UI and `/mcp` — there is exactly one
+HTTP boundary, exactly one secret. Set `MAIL_MCP_HTTP_ENABLED=false` to
+keep the admin UI but disable the network MCP transport.
 
 ### Microsoft Account? Use Graph API
 

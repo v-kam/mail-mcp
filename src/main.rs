@@ -1,21 +1,30 @@
-//! mail-mcp: Secure IMAP MCP server over stdio
+//! mail-mcp: Secure email MCP server with optional admin UI + HTTP transport
 //!
-//! This server provides read/write access to IMAP mailboxes via the Model
-//! Context Protocol (MCP) over stdio. It features cursor-based pagination,
-//! TLS-only connections, and security-first design.
+//! This binary speaks the Model Context Protocol over **two transports**:
+//!
+//! - **stdio**: classic one-shot mode for CLIs and editor-spawned agents
+//!   (Cursor, Claude Code, Claude Desktop launching the binary directly).
+//! - **Streamable HTTP** (MCP 2025-03-26): for long-lived daemons, where
+//!   the AI client connects to `http://host:8080/mcp` over the network.
+//!
+//! The same binary also exposes an embedded React admin UI on the same
+//! HTTP port for adding/verifying mail accounts and viewing per-tool
+//! usage analytics. HTTP MCP and the admin UI are gated by the same
+//! bearer token (`MAIL_MCP_ADMIN_TOKEN`) when set.
 //!
 //! # Architecture
 //!
-//! - [`main`]: Process entry point with env loading and stdio serving
-//! - [`config`]: Environment-driven configuration for accounts and server settings
-//! - [`errors`]: Application error model with MCP error mapping
-//! - [`imap`]: IMAP transport/session operations with timeout wrappers
-//! - [`server`]: MCP tool handlers with validation and business orchestration
-//! - [`models`]: Input/output DTOs and schema-bearing types
-//! - [`mime`]: Message parsing, header/body extraction, and sanitization
-//! - [`message_id`]: Stable, opaque message ID parse/encode logic
-//! - [`pagination`]: Cursor storage with TTL and eviction behavior
+//! - [`main`]: process bootstrap, env loading, tracing, dual transport
+//! - [`config`]: env-driven [`ServerConfig`](config::ServerConfig)
+//! - [`admin`]: SQLite-backed account store, hot-swappable
+//!   [`ConfigManager`](admin::ConfigManager), HTTP server, MCP HTTP
+//!   transport, tool analytics
+//! - [`server`]: MCP tool router + handlers
+//! - [`imap`], [`smtp`], [`graph`], [`ews`], [`oauth2`]: transport modules
+//! - [`mime`], [`message_id`], [`pagination`]: parsing/state helpers
+//! - [`errors`]: typed error model + MCP `ErrorData` mapping
 
+mod admin;
 mod config;
 mod errors;
 mod ews;
@@ -31,34 +40,25 @@ mod smtp;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::Arc;
 
+use admin::{AdminSettings, AdminState, AccountStore, ConfigManager, ToolStatsRegistry};
 use config::ServerConfig;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
 
-/// Application entry point
+/// Application entry point.
 ///
-/// Initializes tracing from environment, loads config, and serves the MCP
-/// server over stdio. This process expects to be spawned by an MCP client
-/// via `stdio` transport.
+/// 1. Loads tracing + env files
+/// 2. Builds [`ServerConfig`] from env vars
+/// 3. Optionally opens the SQLite store and starts the admin HTTP server
+/// 4. Starts the MCP stdio transport (always)
 ///
-/// # Environment Variables
-///
-/// See [`ServerConfig::load_from_env`] for full configuration options.
-///
-/// # Example
-///
-/// ```no_run
-/// MAIL_IMAP_DEFAULT_HOST=imap.example.com \
-/// MAIL_IMAP_DEFAULT_USER=user@example.com \
-/// MAIL_IMAP_DEFAULT_PASS=secret \
-/// cargo run
-/// ```
+/// When the admin server is enabled, the process runs both transports
+/// concurrently and stays alive until either exits.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Install the rustls CryptoProvider globally so that both tokio-rustls (IMAP)
-    // and lettre (SMTP) use the same provider without conflicts.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     dotenvy::dotenv().ok();
@@ -73,14 +73,130 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("starting MCP server transport=Stdio");
-    let config = ServerConfig::load_from_env()?;
-    let update_notice = check_for_updates().await;
-    let service = server::MailImapServer::new(config, update_notice)
-        .serve(stdio())
-        .await?;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mail-mcp");
+
+    let env_config = ServerConfig::load_from_env().or_else(|e| {
+        // Allow startup with no accounts when the admin UI is enabled —
+        // the user will configure accounts through the UI on first run.
+        let admin_settings = AdminSettings::from_env().ok().flatten();
+        if admin_settings.is_some() {
+            tracing::warn!(
+                "starting with no env-configured accounts; the admin UI will let you add some: {e}"
+            );
+            Ok(empty_server_config())
+        } else {
+            Err(e)
+        }
+    })?;
+
+    let admin_settings = AdminSettings::from_env()?;
+    let store: Option<Arc<AccountStore>> = match &admin_settings {
+        Some(s) => Some(Arc::new(AccountStore::open(
+            &s.data_path,
+            s.admin_key.as_deref(),
+        )?)),
+        None => None,
+    };
+
+    let config_manager = Arc::new(ConfigManager::new(env_config, store.clone())?);
+    let runtime_config: ServerConfig = (*config_manager.config()).clone();
+
+    let stats = Arc::new(ToolStatsRegistry::new());
+    server::set_tool_stats(stats.clone());
+
+    let update_notice = if should_check_for_updates(admin_settings.is_some()) {
+        check_for_updates().await
+    } else {
+        None
+    };
+
+    let mcp_server = server::MailImapServer::new(runtime_config, update_notice);
+
+    match admin_settings {
+        Some(settings) => {
+            run_with_admin(mcp_server, config_manager, stats, settings).await?;
+        }
+        None => {
+            run_stdio_only(mcp_server).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run only the stdio MCP transport (legacy mode, no admin UI).
+async fn run_stdio_only(server: server::MailImapServer) -> Result<(), Box<dyn std::error::Error>> {
+    let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Run both the stdio MCP transport and the admin HTTP server. Returns
+/// when either side exits (typically `Ctrl-C`).
+async fn run_with_admin(
+    server: server::MailImapServer,
+    config_manager: Arc<ConfigManager>,
+    stats: Arc<ToolStatsRegistry>,
+    settings: AdminSettings,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let admin_state = AdminState {
+        config_manager: config_manager.clone(),
+        stats,
+        settings: Arc::new(settings),
+        version: env!("CARGO_PKG_VERSION"),
+    };
+
+    // Run stdio MCP in the background so that a closed stdin (typical
+    // when the container is started as a daemon for the admin UI) does
+    // not also terminate the admin HTTP server. The admin server is the
+    // primary task; stdio exits silently when no MCP client is attached.
+    let stdio_task = tokio::spawn(async move {
+        if let Err(e) = run_stdio_only(server).await {
+            tracing::warn!("stdio MCP transport ended: {e}");
+        }
+    });
+
+    let admin_result = admin::serve(admin_state).await;
+    stdio_task.abort();
+    admin_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok(())
+}
+
+/// Whether to perform a startup update check. Skipped when the admin UI
+/// is enabled (the UI surfaces the version + update banner instead) or
+/// when `MAIL_MCP_UPDATE_CHECK=false` is set explicitly.
+fn should_check_for_updates(admin_enabled: bool) -> bool {
+    if let Ok(v) = std::env::var("MAIL_MCP_UPDATE_CHECK") {
+        return matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    !admin_enabled
+}
+
+/// Build a [`ServerConfig`] with no accounts. Used as a fallback when the
+/// admin UI is enabled but `MAIL_*` env vars are not set — the UI will
+/// let the user add accounts.
+fn empty_server_config() -> ServerConfig {
+    ServerConfig {
+        accounts: BTreeMap::new(),
+        oauth2_accounts: Default::default(),
+        graph_oauth2_accounts: Default::default(),
+        ews_accounts: Default::default(),
+        ews_oauth2_accounts: Default::default(),
+        smtp_accounts: Default::default(),
+        smtp_write_enabled: false,
+        smtp_save_sent: false,
+        smtp_connect_timeout_ms: 30_000,
+        smtp_send_timeout_ms: 300_000,
+        write_enabled: false,
+        connect_timeout_ms: 30_000,
+        greeting_timeout_ms: 15_000,
+        socket_timeout_ms: 300_000,
+        cursor_ttl_seconds: 600,
+        cursor_max_entries: 512,
+    }
 }
 
 /// Check GitHub for newer releases. Returns a notice string if an update is available.
@@ -155,11 +271,26 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
 
     out.push_str("mail-mcp\n");
-    out.push_str("Secure IMAP MCP server over stdio\n\n");
+    out.push_str("Secure email MCP server (stdio) with optional admin UI\n\n");
 
     out.push_str("Usage:\n");
     out.push_str("  mail-mcp\n");
     out.push_str("  mail-mcp --help\n\n");
+
+    out.push_str("Admin UI / HTTP MCP environment\n");
+    out.push_str("  MAIL_MCP_ADMIN_PORT       (default 8080 when admin enabled)\n");
+    out.push_str("  MAIL_MCP_ADMIN_HOST       (default 127.0.0.1, or 0.0.0.0 if token set)\n");
+    out.push_str("  MAIL_MCP_ADMIN_TOKEN      (required for non-loopback bind; gates UI + /mcp)\n");
+    out.push_str("  MAIL_MCP_ADMIN_KEY        (master key used to encrypt secrets in SQLite)\n");
+    out.push_str("  MAIL_MCP_DATA_DIR         (default /data; SQLite lives at <dir>/mail-mcp.db)\n");
+    out.push_str("  MAIL_MCP_ADMIN_ENABLED    (true|false to force-enable/disable)\n");
+    out.push_str("  MAIL_MCP_HTTP_ENABLED     (default true; set false to disable /mcp)\n");
+    out.push_str("  MAIL_MCP_UPDATE_CHECK     (true|false; default false when admin is on)\n\n");
+
+    out.push_str("MCP transports\n");
+    out.push_str("  stdio: always available (run the binary; speak JSON-RPC over stdin/stdout)\n");
+    out.push_str("  http : POST/GET/DELETE http://<host>:<port>/mcp (MCP Streamable HTTP)\n");
+    out.push_str("  Both transports are served by the same process when the admin UI is on.\n\n");
 
     out.push_str("IMAP environment setup\n");
     out.push_str("  Required per account section MAIL_IMAP_<ACCOUNT>_:\n");
@@ -168,10 +299,7 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("    MAIL_IMAP_<ACCOUNT>_PASS\n");
     out.push_str("  Optional per account section:\n");
     out.push_str("    MAIL_IMAP_<ACCOUNT>_PORT (default: 993)\n");
-    out.push_str("    MAIL_IMAP_<ACCOUNT>_SECURE (default: true)\n");
-    out.push_str(
-        "  If no account section is discovered from environment, DEFAULT is used by convention.\n\n",
-    );
+    out.push_str("    MAIL_IMAP_<ACCOUNT>_SECURE (default: true)\n\n");
 
     out.push_str("Discovered account sections (from current environment)\n");
     if account_sections.is_empty() {
@@ -188,16 +316,12 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     }
     out.push('\n');
 
-    // OAuth2 section
     let oauth2_sections = discover_oauth2_sections(env_map);
     out.push_str("OAuth2 environment setup (optional, per account)\n");
     out.push_str("  MAIL_OAUTH2_<ACCOUNT>_PROVIDER    (google | microsoft)\n");
     out.push_str("  MAIL_OAUTH2_<ACCOUNT>_CLIENT_ID\n");
     out.push_str("  MAIL_OAUTH2_<ACCOUNT>_CLIENT_SECRET\n");
-    out.push_str("  MAIL_OAUTH2_<ACCOUNT>_REFRESH_TOKEN\n");
-    out.push_str(
-        "  When set, IMAP PASS becomes optional and XOAUTH2 is used for authentication.\n\n",
-    );
+    out.push_str("  MAIL_OAUTH2_<ACCOUNT>_REFRESH_TOKEN\n\n");
 
     out.push_str("Discovered OAuth2 sections (from current environment)\n");
     if oauth2_sections.is_empty() {
@@ -214,7 +338,6 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     }
     out.push('\n');
 
-    // SMTP section
     let smtp_sections = discover_smtp_sections(env_map);
     out.push_str("SMTP environment setup (optional, per account)\n");
     out.push_str("  MAIL_SMTP_<ACCOUNT>_HOST\n");
@@ -256,7 +379,7 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("Send/write gate policy\n");
     out.push_str("  IMAP write tools are blocked unless MAIL_IMAP_WRITE_ENABLED=true.\n");
     out.push_str("  SMTP send tools are blocked unless MAIL_SMTP_WRITE_ENABLED=true.\n");
-    out.push_str("  These gates protect against accidental mutations and sending.\n");
+    out.push_str("  These gates can also be toggled at runtime through the admin UI.\n");
 
     out
 }
@@ -349,7 +472,7 @@ mod tests {
 
     use super::{
         build_help_output, discover_account_sections, is_secret_key, redact_value,
-        should_print_help,
+        should_check_for_updates, should_print_help,
     };
 
     #[test]
@@ -415,5 +538,47 @@ mod tests {
         assert!(help.contains("MAIL_IMAP_WRITE_ENABLED=false"));
         assert!(help.contains("Send/write gate policy"));
         assert!(help.contains("MAIL_IMAP_DEFAULT_PASS=<redacted>"));
+        assert!(help.contains("Admin UI environment"));
+    }
+
+    #[test]
+    fn update_check_default_disabled_when_admin_on() {
+        let _g = EnvLock::new("MAIL_MCP_UPDATE_CHECK", None);
+        assert!(!should_check_for_updates(true));
+        assert!(should_check_for_updates(false));
+    }
+
+    #[test]
+    fn update_check_explicit_override() {
+        let _g = EnvLock::new("MAIL_MCP_UPDATE_CHECK", Some("true"));
+        assert!(should_check_for_updates(true));
+    }
+
+    /// Helper: scope an env var change for a single test.
+    struct EnvLock {
+        key: &'static str,
+        previous: Option<String>,
+    }
+    impl EnvLock {
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { key, previous }
+        }
+    }
+    impl Drop for EnvLock {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
     }
 }

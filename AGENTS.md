@@ -7,7 +7,9 @@ Guidance for coding agents working in `mail-mcp`.
 - Language: Rust (edition `2024`)
 - Runtime: `tokio`
 - Protocol framework: `rmcp`
-- Domain: IMAP-backed MCP server over stdio
+- Domain: Email MCP server. Speaks MCP over **two transports** in one
+  binary: stdio (classic launcher) and Streamable HTTP at `/mcp`
+  (long-lived daemon, mounted on the admin port).
 - Entry point: `src/main.rs`
 - Main server implementation: `src/server.rs`
 
@@ -84,7 +86,10 @@ The repository includes a minimal multi-stage Dockerfile for running the MCP ser
 
 ### Docker Notes for Agents
 
-- Keep MCP transport as stdio (do not add HTTP listener behavior by default).
+- The container exposes **two MCP transports** simultaneously: stdio
+  (always on, via `docker exec`) and Streamable HTTP at `/mcp` on the
+  admin port (mounted whenever the admin UI is enabled). Do not remove
+  either without an explicit user request.
 - Keep runtime image minimal (current pattern: builder image + `scratch`).
 - If dependencies require a non-scratch runtime, document why in the PR/commit message.
 - Keep `.dockerignore` aligned with repo layout to avoid leaking local files and reduce context size.
@@ -137,15 +142,38 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 
 ## Architecture and File Ownership
 
-- `src/main.rs`: process bootstrap, env loading, tracing init, stdio serving.
+- `src/main.rs`: process bootstrap, env loading, tracing init, dual transport (stdio MCP always on, admin HTTP server hosting the React UI + MCP Streamable HTTP at `/mcp`).
 - `src/config.rs`: env-driven account/server config parsing.
 - `src/errors.rs`: app-level error model and MCP error mapping.
 - `src/imap.rs`: IMAP transport/session operations with timeout wrappers.
-- `src/server.rs`: MCP tool handlers, validation, business orchestration.
+- `src/server.rs`: MCP tool handlers, validation, business orchestration; owns `tool_catalog()` and `set_tool_stats()`.
 - `src/models.rs`: input/output DTOs and schema-bearing types.
 - `src/mime.rs`: message parsing, header/body extraction, sanitization.
 - `src/message_id.rs`: stable message id parse/encode logic.
 - `src/pagination.rs`: cursor storage and TTL/eviction behavior.
+- `src/admin/`: admin HTTP UI + HTTP MCP transport subsystem.
+  - `mod.rs`: `AdminSettings`, `AdminState`, axum bootstrap. The
+    composed router merges `/api/*` (admin REST), `/mcp` and `/mcp/`
+    (MCP Streamable HTTP), and the SPA fallback.
+  - `routes.rs`: REST handlers and bearer-token middleware. `/api/health`
+    reports `mcp_http_enabled` and `mcp_http_path` so the dashboard can
+    show the right HTTP MCP URL.
+  - `mcp_http.rs`: MCP Streamable HTTP transport. Wraps `rmcp`'s
+    `StreamableHttpService` with the same bearer-token check as the
+    admin UI and creates a fresh `MailImapServer` per session from
+    `ConfigManager::config()`. Disabled by `MAIL_MCP_HTTP_ENABLED=false`.
+  - `store.rs`: SQLite store with ChaCha20-Poly1305 + Argon2id encryption-at-rest.
+  - `config_manager.rs`: hot-reloadable runtime config (ArcSwap).
+  - `stats.rs`: `ToolStatsRegistry` per-tool counters.
+  - `verify.rs`: connectivity verification reusable by routes.
+  - `static_files.rs`: rust-embed handler for the React build.
+- `frontend/`: Vite + React + TypeScript admin UI. Built into `frontend/dist/` and embedded into the binary via `rust-embed`.
+  - `frontend/src/components/ui/`: shadcn/ui primitives (Button, Card, Dialog, Input, Label, Select, Switch, Tabs, Table, Badge, Alert, Separator). New primitives go here using the existing `cva` + Radix pattern.
+  - `frontend/src/components/AccountWizard.tsx`: 3-step provider-aware wizard used by the Accounts page. Accepts an optional `editAccount` prop — when present it skips the provider-tile step, locks `account_id`, and treats empty password fields as "keep current secret".
+  - `frontend/src/pages/DashboardPage.tsx`: landing page (`/`) with summary cards, copy-able MCP client config snippets, and the bearer-token vs MCP-transport auth explainer.
+  - `frontend/src/pages/SetupPage.tsx`: brief 3-step pitch + flat list of provider credential pages. Detailed per-provider how-tos live inline in the wizard's Step 2.
+  - `frontend/src/lib/providers.ts`: provider catalogue (Gmail, Microsoft, iCloud, Yahoo, Fastmail, Zoho, custom) — defaults, supported auth methods, deep links, step-by-step setup instructions. Single source of truth for the wizard and the `/setup` page.
+  - Styling rule: **Tailwind utilities only**. No bespoke CSS rules outside the shadcn token block in `frontend/src/styles.css`.
 
 ## Code Style Guidelines
 
@@ -229,10 +257,44 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 - Update docs when behavior or bounds change.
 - If adding env vars, document them in `docs/tool-contract.md` and this file.
 
+## Frontend (admin UI)
+
+The React/Vite app lives in `frontend/`. Build commands:
+
+- Install deps: `npm install` (in `frontend/`)
+- Dev server with hot-reload: `npm run dev` (proxies `/api` to `127.0.0.1:8080`)
+- Production build: `npm run build` → `frontend/dist/`
+- Tests: `npm test`
+
+The Rust crate embeds `frontend/dist/` via `rust-embed` at compile time.
+A placeholder `frontend/dist/.gitkeep` keeps the directory committable
+even when no production build is present.
+
+### UI conventions
+
+- **Tailwind + shadcn/ui only.** No hand-written CSS rules outside the
+  shadcn token block in `src/styles.css`. Variant-driven components use
+  `class-variance-authority`; `cn()` from `src/lib/utils.ts` merges
+  Tailwind classes safely.
+- **Path alias.** `@/` resolves to `frontend/src/`. Import shadcn
+  primitives as `@/components/ui/<name>`.
+- **Provider catalogue.** `src/lib/providers.ts` is the single source
+  of truth for IMAP/SMTP defaults, supported auth methods, credential
+  deep-links, and setup steps. The wizard and `/setup` page render off
+  this list — adding a new provider requires only extending the array.
+- **Account creation goes through the wizard** (`AccountWizard.tsx`).
+  Avoid raw `<form>` editors; the wizard pre-fills hosts from the
+  picked provider so users never type `imap.gmail.com` from memory.
+- **Forced dark theme.** `<html class="dark">` is set in `index.html`.
+  All colour utilities resolve through the `bg-background`,
+  `text-foreground`, `bg-card`, `text-muted-foreground`, etc. tokens.
+
 ## Quick Pre-Commit Checklist
 
-- Code formatted
+- Code formatted (`cargo fmt`)
 - Clippy clean with warnings denied
-- Tests passing
+- Rust tests passing (`cargo test`)
+- Frontend tests passing (`cd frontend && npm test`) when frontend code changed
 - No secrets in code/log output
 - Contract and validation invariants preserved
+- `docs/` and `README.md` updated to reflect behavior changes

@@ -206,9 +206,55 @@ All tool responses include metadata for auditing:
 3. **Test boundaries**: Test input validation and output bounding thoroughly
 4. **Secret management**: Never hardcode credentials in code or tests
 
+## Admin UI + HTTP MCP Security
+
+When the embedded management UI is enabled (see
+[admin-ui.md](admin-ui.md)) it also mounts the **MCP Streamable HTTP
+transport** at `/mcp` on the same listener. The following extra
+controls apply:
+
+- **One bearer token, one boundary**: `MAIL_MCP_ADMIN_TOKEN` gates the
+  admin UI, the `/api/*` REST endpoints, *and* the MCP transport at
+  `/mcp`. The token is compared in constant time on every request.
+- **Bind-address guard**: the process refuses to start if the admin
+  port is bound to a non-loopback address without a token.
+- **HTTP MCP opt-out**: set `MAIL_MCP_HTTP_ENABLED=false` to keep the
+  admin UI but disable the network MCP transport. Useful when only the
+  stdio launcher is required and you want a smaller attack surface.
+- **AEAD-encrypted secrets at rest**: account passwords, OAuth2 client
+  secrets, and refresh tokens stored in the SQLite database are
+  encrypted with ChaCha20-Poly1305 using a key derived from
+  `MAIL_MCP_ADMIN_KEY` via Argon2id (16-byte salt stored in the
+  `meta` table on first init). Without the master key the store opens
+  read-only and HTTP MCP tool calls that need credentials fail
+  gracefully.
+- **Secret omission keeps existing values**: API writes that omit a
+  secret field do *not* clear it, preventing accidental credential
+  wipes from incomplete UI submissions.
+- **No secret echo over the wire**: `GET /api/accounts` always returns
+  secret fields as `null`; the UI form shows `(unchanged)` placeholders
+  rather than the real value.
+- **Stateful sessions are in-memory only**: the rmcp `LocalSessionManager`
+  drops sessions on restart. There is no on-disk session log to leak.
+
+## Update check
+
+The startup update check (HTTP GET to `api.github.com`) is **disabled
+by default** when the admin UI is enabled — the UI surfaces version
+information instead. To force-enable it set
+`MAIL_MCP_UPDATE_CHECK=true`. To disable it explicitly in stdio-only
+mode, set `MAIL_MCP_UPDATE_CHECK=false`.
+
 ## Known Limitations
 
 1. **No STARTTLS support**: Only implicit TLS (IMAPS) is supported
 2. **No certificate pinning**: Certificates are validated per standard PKI; custom CA chains are not supported
 3. **No client authentication**: Client certificates are not supported
-4. **No encryption at rest**: Credentials are in memory only; disk encryption is the user's responsibility
+4. **MCP hot reload**: each new MCP session (HTTP or stdio) reads a
+   fresh config snapshot from the admin store. In-flight sessions
+   continue to use the snapshot they started with — reconnect your AI
+   client after editing accounts to pick up the new state. (Stdio
+   launches always start fresh, so this only affects long-lived HTTP
+   sessions.)
+5. **No TLS on the admin port**: terminate TLS at a reverse proxy
+   (nginx, Caddy, Traefik) when exposing the UI beyond localhost.

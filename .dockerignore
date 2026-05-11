@@ -1,8 +1,13 @@
 target
 .git
 .gitignore
-README.md
-AGENTS.md
 .env
 .env.*
 *.log
+# Frontend artifacts — rebuilt inside the image.
+frontend/node_modules
+frontend/dist
+# IDE/local
+.cursor
+.vscode
+.idea
